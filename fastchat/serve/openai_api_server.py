@@ -11,7 +11,7 @@ import asyncio
 import argparse
 import json
 import os
-from typing import Generator, Optional, Union, Dict, List, Any
+from typing import Dict, List, Union, Iterable, Optional, overload,Literal, Optional,Any,Generator
 
 import aiohttp
 import fastapi
@@ -63,6 +63,16 @@ from fastchat.protocol.api_protocol import (
     APITokenCheckRequest,
     APITokenCheckResponse,
     APITokenCheckResponseItem,
+)
+from fastchat.protocol.openai_api_protocol import (
+    FunctionCall,
+    ChatCompletionMessageToolCall,
+    ChatCompletionToolParam,
+    ChatCompletionFunctionCallOptionParam,
+    FunctionDefinition,
+    ChatCompletionNamedToolChoiceParam,
+    ChatCompletionToolParam
+
 )
 from fastchat.utils import build_logger
 
@@ -271,6 +281,10 @@ async def get_gen_params(
     worker_addr: str,
     messages: Union[str, List[Dict[str, str]]],
     *,
+    function_call: ChatCompletionFunctionCallOptionParam = None,
+    functions: List[FunctionDefinition]  = None,
+    tool_choice: ChatCompletionNamedToolChoiceParam = None,
+    tools: List[ChatCompletionToolParam] = None,
     temperature: float,
     top_p: float,
     top_k: Optional[int],
@@ -283,6 +297,8 @@ async def get_gen_params(
     best_of: Optional[int] = None,
     use_beam_search: Optional[bool] = None,
 ) -> Dict[str, Any]:
+    logger.info(f"tools:\n{tools}")
+    logger.info(f"functions:\n{functions}")
     conv = await get_conv(model_name, worker_addr)
     conv = Conversation(
         name=conv["name"],
@@ -327,7 +343,68 @@ async def get_gen_params(
                 conv.append_message(conv.roles[1], message["content"])
             else:
                 raise ValueError(f"Unknown role: {msg_role}")
+        
+        
+        def get_tools_signature(tools:List[Union[ChatCompletionToolParam,FunctionDefinition]],func_or_tool:str='tool'):
+            signature=""
+            ser_tools=[]
+            for index, tool in enumerate(tools):
+                ser_tools.append(tool.model_dump())
+                if func_or_tool=='tool':
+                    func=tool.function
+                else:
+                    func=tool
+                signature+=f"{index}.Name:{func.name}\n"
+                signature+=f"Description:{func.description}\n"
+                signature+=f"Parameters:\n"
+                signature+=json.dumps(func.parameters)+"\n"
+            logger.info(f"single tools:\n {ser_tools}")
+            return signature,ser_tools
+        
+        system_ms=conv.system_message+"\n"
+        
+        if tools or functions:
+            
+            system_ms+="""You may use the following FUNCTIONS in the response.  Give output in following OUTPUT_FORMAT in strict JSON if needed
+            Otherwise, based on the context,the request is not related to any function,just return PLAIN TEXT. 
+            FUNCTIONS:\n"""
+            if tools:
+                ms,tools=get_tools_signature(tools,func_or_tool='tool')
+                system_ms+=ms
+            elif functions:
+                ms,functions=get_tools_signature(functions,func_or_tool='func')
+                system_ms+=ms
+            system_ms+="""
+            You must decide how many functions need to be output. If you use one function:
+            OUTPUT_FORMAT:
+            {
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "name": "<name of function>",
+                        "arguments": "<parameters to pass to function>"
+                    }
+                ]
+            }
 
+            If you need more than one function:
+            OUTPUT_FORMAT:
+            {
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "name": "<name of function>",
+                        "arguments": "<parameters to pass to function>"
+                    },
+                    {
+                        "type": "function",
+                        "name": "<name of function>",
+                        "arguments": "<parameters to pass to function>"
+                    }
+                ]
+            }
+            """
+            conv.set_system_message(system_ms)
         # Add a blank message for the assistant.
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
@@ -336,6 +413,10 @@ async def get_gen_params(
     gen_params = {
         "model": model_name,
         "prompt": prompt,
+        "function_call":function_call,
+        "functions":functions,
+        "tool_choice":tool_choice,
+        "tools":tools,
         "temperature": temperature,
         "logprobs": logprobs,
         "top_p": top_p,
@@ -412,6 +493,7 @@ async def show_available_models():
 @app.post("/v1/chat/completions", dependencies=[Depends(check_api_key)])
 async def create_chat_completion(request: ChatCompletionRequest):
     """Creates a completion for the chat message"""
+    logger.info(f"the the request: {request.model_dump()}")
     error_check_ret = await check_model(request)
     if error_check_ret is not None:
         return error_check_ret
@@ -426,6 +508,10 @@ async def create_chat_completion(request: ChatCompletionRequest):
         worker_addr,
         request.messages,
         temperature=request.temperature,
+        function_call=request.function_call,
+        functions=request.functions,
+        tool_choice=request.tool_choice,
+        tools=request.tools,
         top_p=request.top_p,
         top_k=request.top_k,
         presence_penalty=request.presence_penalty,
@@ -434,6 +520,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
         echo=False,
         stop=request.stop,
     )
+    logger.info(f"params:{gen_params}")
 
     max_new_tokens, error_check_ret = await check_length(
         request,
@@ -469,10 +556,32 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
         if content["error_code"] != 0:
             return create_error_response(content["error_code"], content["text"])
+        raw_content=content["text"]
+        logger.info(f"raw content:\n {raw_content}")
+        if gen_params.get('tools',None) or gen_params.get('functions',None):
+            try:
+                json_content=json.loads(raw_content)
+                tool_calls=json_content.get('tool_calls',[])
+                tools=[]
+                if tool_calls:
+                    for tool_call in tool_calls:
+                        tools.append(ChatCompletionMessageToolCall(
+                                                      function=FunctionCall(name=tool_call["name"],arguments=tool_call["arguments"]),
+                                                      type=tool_call["type"])
+                        )
+                    message=ChatMessage(role="assistant", content=None,tool_calls=tools)
+                else:
+                    message=ChatMessage(role="assistant", content=raw_content)
+            except Exception as e:
+                logger.info(f"content do not have function: {e}")
+                message=ChatMessage(role="assistant", content=raw_content)
+        else:
+            message=ChatMessage(role="assistant", content=raw_content)
+
         choices.append(
             ChatCompletionResponseChoice(
                 index=i,
-                message=ChatMessage(role="assistant", content=content["text"]),
+                message=message,
                 finish_reason=content.get("finish_reason", "stop"),
             )
         )
@@ -480,6 +589,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
             task_usage = UsageInfo.parse_obj(content["usage"])
             for usage_key, usage_value in task_usage.dict().items():
                 setattr(usage, usage_key, getattr(usage, usage_key) + usage_value)
+    logger.info(f"final results:\n {ChatCompletionResponse(model=request.model, choices=choices, usage=usage)}")
 
     return ChatCompletionResponse(model=request.model, choices=choices, usage=usage)
 
