@@ -71,7 +71,8 @@ from fastchat.protocol.openai_api_protocol import (
     ChatCompletionFunctionCallOptionParam,
     FunctionDefinition,
     ChatCompletionNamedToolChoiceParam,
-    ChatCompletionToolParam
+    ChatCompletionToolParam,
+    ChatMessage
 
 )
 from fastchat.utils import build_logger
@@ -279,7 +280,7 @@ def _add_to_set(s, new_stop):
 async def get_gen_params(
     model_name: str,
     worker_addr: str,
-    messages: Union[str, List[Dict[str, str]]],
+    messages: Union[str, List[ChatMessage],List[Dict[str,object]]],
     *,
     function_call: ChatCompletionFunctionCallOptionParam = None,
     functions: List[FunctionDefinition]  = None,
@@ -319,6 +320,8 @@ async def get_gen_params(
         images = []
     else:
         for message in messages:
+            if isinstance(message,ChatMessage):
+                message=message.model_dump()
             msg_role = message["role"]
             if msg_role == "system":
                 conv.set_system_message(message["content"])
@@ -340,6 +343,10 @@ async def get_gen_params(
                 else:
                     conv.append_message(conv.roles[0], message["content"])
             elif msg_role == "assistant":
+                conv.append_message(conv.roles[1], message["content"])
+            elif msg_role == "tool":
+                conv.append_message(conv.roles[1], message["content"])
+            elif msg_role == "function":
                 conv.append_message(conv.roles[1], message["content"])
             else:
                 raise ValueError(f"Unknown role: {msg_role}")
@@ -365,8 +372,10 @@ async def get_gen_params(
         
         if tools or functions:
             
-            system_ms+="""You may use the following FUNCTIONS in the response.  Give output in following OUTPUT_FORMAT in strict JSON if needed
-            Otherwise, based on the context,the request is not related to any function,just return PLAIN TEXT. 
+            system_ms+="""You may use the following FUNCTIONS in the response, but only if they are necessary to fulfill the request. 
+            If the request can be answered directly without using any functions, please provide the answer in PLAIN TEXT. 
+            If one or more functions are required, format the output in strict JSON using the provided OUTPUT_FORMAT ,
+            and do not include any additional text or explanations in your response. 
             FUNCTIONS:\n"""
             if tools:
                 ms,tools=get_tools_signature(tools,func_or_tool='tool')
@@ -565,9 +574,12 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 tools=[]
                 if tool_calls:
                     for tool_call in tool_calls:
+                        arguments=tool_call["arguments"]
+                        if isinstance(arguments,dict):
+                            arguments=json.dumps(arguments)
                         tools.append(ChatCompletionMessageToolCall(
-                                                      function=FunctionCall(name=tool_call["name"],arguments=tool_call["arguments"]),
-                                                      type=tool_call["type"])
+                                                      function=FunctionCall(name=tool_call["name"],arguments=arguments)
+                                                      )
                         )
                     message=ChatMessage(role="assistant", content=None,tool_calls=tools)
                 else:
